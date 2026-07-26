@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+
+# Environment
+.env
+.envrc
+
+# Database
+backend/health_signals.db
+
+# Node
+node_modules/
+dist/
+build/
+
+# Misc
+.DS_Store
+*.log
+.ruff_cache/
+tempCodeRunnerFile.py
