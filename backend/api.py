@@ -1,7 +1,6 @@
 """
-Phase 4: FastAPI Backend with SSE Streaming
-Exposes POST /query that streams agent activity and answer tokens to the frontend.
-MCP session is initialized once on startup and reused across all requests.
+FastAPI SSE backend — initialises the MCP session once on startup and streams
+agent activity and answer tokens to the frontend via POST /query.
 """
 
 import os

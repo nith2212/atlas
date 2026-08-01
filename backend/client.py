@@ -1,7 +1,6 @@
 """
-Phase 3: Agentic MCP Client with LLM Orchestration
-Connects to server.py via stdio, hands off tool schemas to Groq,
-and executes multi-step data lookups dynamically.
+Terminal agentic client — connects to server.py via stdio, hands tool schemas
+to Groq, and runs multi-step data lookups interactively in the terminal.
 """
 
 import os

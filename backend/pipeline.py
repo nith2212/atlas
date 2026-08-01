@@ -1,6 +1,5 @@
 """
-Phase 1: ETL Ingestion Pipeline
-Fetches WHO OData JSON, applies defensive cleaning, and populates health_signals.db.
+ETL pipeline — fetches WHO GHO OData JSON, cleans it, and populates health_signals.db.
 """
 
 import sqlite3
@@ -26,11 +25,11 @@ def init_db():
 def fetch_and_clean(indicator_key, indicator_code):
     url = f"{WHO_BASE_URL}/{indicator_code}"
     params = {"$filter": "SpatialDimType eq 'COUNTRY' and TimeDim ge 2015"}
-    
-    print(f"[ETL] Requesting WHO API for '{indicator_key}' ({indicator_code})... (may take 30-60s for large datasets)")
+
+    print(f"[ETL] Fetching '{indicator_key}' ({indicator_code})... (may take 30–60s)")
     response = requests.get(url, params=params, timeout=120)
     response.raise_for_status()
-    print(f"[ETL] Download complete ({len(response.content) // 1024} KB). Parsing...")
+    print(f"[ETL] Downloaded {len(response.content) // 1024} KB. Parsing...")
     
     raw_data = response.json().get("value", [])
     cleaned_rows = []
@@ -64,8 +63,8 @@ def run_pipeline():
     cursor = conn.cursor()
     total_inserted = 0
     
-    for label, code in INDICATORS.items():
-        rows = fetch_and_clean(label, code)
+    for label, meta in INDICATORS.items():
+        rows = fetch_and_clean(label, meta["code"])
         cursor.executemany("""
             INSERT OR IGNORE INTO disease_indicators 
             (indicator_name, country_code, year, numeric_value)
