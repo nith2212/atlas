@@ -13,7 +13,7 @@ env/
 .envrc
 
 # Database
-backend/health_signals.db
+#backend/health_signals.db
 
 # Node
 node_modules/
