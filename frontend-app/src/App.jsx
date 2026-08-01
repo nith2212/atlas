@@ -17,7 +17,8 @@ export default function App() {
     startTimeRef.current = Date.now();
     setResult({ query, answer: "", streaming: true, activities: [], evidence: [], elapsed: null });
 
-    const response = await fetch("http://localhost:8000/query", {
+    const API_URL = import.meta.env.VITE_API_URL;
+    const response = await fetch(`${API_URL}/query`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ query }),
