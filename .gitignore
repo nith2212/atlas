@@ -25,3 +25,6 @@ build/
 *.log
 .ruff_cache/
 tempCodeRunnerFile.py
+
+#md
+v2.md
