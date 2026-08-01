@@ -1,7 +1,5 @@
-import EvidenceBlock from "./EvidenceBlock";
-
 export default function ResultsView({ result }) {
-  const { query, answer, streaming, activities, evidence, elapsed } = result;
+  const { query, answer, streaming, activities, elapsed } = result;
   const toolCount = activities.filter((a) => a.name !== "Answer generated").length;
 
   return (
@@ -43,20 +41,6 @@ export default function ResultsView({ result }) {
           <div className="elapsed">{toolCount} tool{toolCount !== 1 ? "s" : ""} · {elapsed}s</div>
         )}
       </section>
-
-      {evidence.length > 0 && (
-        <>
-          <div className="section-divider" />
-          <section className="result-section">
-            <div className="section-label">Evidence</div>
-            <div className="evidence-tables">
-              {evidence.map((ev, i) => (
-                <EvidenceBlock key={i} data={ev} />
-              ))}
-            </div>
-          </section>
-        </>
-      )}
 
       {activities.length > 0 && !streaming && (
         <>

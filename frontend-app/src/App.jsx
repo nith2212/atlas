@@ -2,6 +2,7 @@ import { useState, useRef } from "react";
 import QueryBar from "./components/QueryBar";
 import ResultsView from "./components/ResultsView";
 import EmptyState from "./components/EmptyState";
+import EvidenceBlock from "./components/EvidenceBlock";
 import "./App.css";
 
 export default function App() {
@@ -51,7 +52,6 @@ export default function App() {
               const activities = prev.activities.map((a, i) =>
                 i === prev.activities.length - 1 ? { ...a, status: "done" } : a
               );
-              // data.result is now a typed object — store directly
               const evidence = data.result.type !== "error" ? [...prev.evidence, data.result] : prev.evidence;
               return { ...prev, activities, evidence };
             });
@@ -83,7 +83,23 @@ export default function App() {
       <main className={`app-main ${!result ? "app-main--centered" : ""}`}>
         {!result && <EmptyState onSelect={sendQuery} />}
         <QueryBar onSend={sendQuery} isLoading={isLoading} />
-        {result && <ResultsView result={result} />}
+        {result && (
+          <div className="results-layout">
+            <div className="results-left">
+              <ResultsView result={result} />
+            </div>
+            {result.evidence.length > 0 && (
+              <div className="results-right fade-in">
+                <div className="section-label">Evidence</div>
+                <div className="evidence-tables">
+                  {result.evidence.map((ev, i) => (
+                    <EvidenceBlock key={i} data={ev} />
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
       </main>
     </div>
   );
