@@ -1,0 +1,300 @@
+Atlas — WHO Health Data Platform: Full Technical Brief
+What This Project Is
+Atlas is a full-stack AI-powered health data platform built on top of the WHO Global Health Observatory (GHO) API. A user types a natural language question like "What is the obesity rate in USA vs Japan in 2019?" and gets back a structured evidence table + narrative interpretation powered by an LLM. The architecture combines ETL pipelines, a PostgreSQL cache layer, MCP (Model Context Protocol) tools, and a React frontend.
+
+V1 Architecture
+What V1 Was
+A simple ETL + MCP proof of concept. Hardcoded 4 WHO indicators, SQLite database, no metadata layer.
+
+Stack
+Backend: Python, FastAPI, MCP (FastMCP), SQLite
+
+Frontend: React + Vite
+
+LLM: Groq (llama-3.3-70b-versatile)
+
+Data source: WHO GHO OData API (https://ghoapi.azureedge.net/api)
+
+Key Files (V1)
+pipeline.py — fetched data from WHO for 4 hardcoded indicators, stored in SQLite
+
+server.py — MCP tools that queried SQLite directly
+
+api.py — FastAPI SSE backend, managed MCP session, streamed LLM responses
+
+config.py — had hardcoded indicator definitions including WHO codes, display names, higher_is_better
+
+health_signals.db — SQLite database
+
+V1 MCP Tools
+4 tools, all accepted WHO codes directly:
+
+get_country_health_profile(country, year)
+
+compare_countries(country_a, country_b, year)
+
+get_health_trend(country, indicator_code, start, end)
+
+rank_countries_by_indicator(indicator_code, year)
+
+V1 Problems
+LLM had to remember opaque WHO codes like WHOSIS_000001 across tool calls — unreliable
+
+Only 4 indicators hardcoded
+
+SQLite not scalable
+
+No metadata layer — indicator names, units, direction all lived in Python config
+
+V2 Architecture
+What V2 Is
+A proper health data platform. 3072 WHO indicators in metadata, PostgreSQL on Neon, cache-aside pattern, composite MCP tools that accept plain English, LLM-inferred indicator direction.
+
+Stack
+Backend: Python, FastAPI, MCP (FastMCP), PostgreSQL (Neon serverless)
+
+Database: psycopg v3 + psycopg-pool ConnectionPool
+
+Frontend: React + Vite, deployed on Vercel
+
+LLM: Groq (llama-3.3-70b-versatile)
+
+Git: https://github.com/nith2212/atlas.git, branch v2-dev
+
+Database Schema
+indicators_metadata
+
+code             TEXT PRIMARY KEY   -- WHO indicator code e.g. NCD_BMI_30C
+name             TEXT               -- "Obesity among adults, BMI ≥ 30 kg/m2 (%)"
+description      TEXT
+category         TEXT
+unit             TEXT
+higher_is_better BOOLEAN            -- LLM-inferred, stored permanently
+last_updated     TIMESTAMP
+coverage         JSONB              -- {min_year, max_year, country_count, countries[]}
+
+Copy
+indicator_cache
+
+indicator_code  TEXT
+country_code    TEXT               -- ISO 3-letter e.g. USA, JPN, IND
+year            INTEGER
+value           REAL
+cached_at       TIMESTAMP
+PRIMARY KEY (indicator_code, country_code, year)
+
+Copy
+Special sentinel row: country_code = '__NOCOVERAGE__', year = 0 marks indicators that were fetched from WHO but returned 0 rows — prevents infinite re-fetch loops.
+
+V2 File Structure
+backend/
+├── config.py                    # Infrastructure constants + PRELOAD_INDICATORS list
+├── api.py                       # FastAPI SSE backend + MCP client session
+├── server.py                    # MCP tools server (5 tools)
+├── database/
+│   └── postgres.py              # ConnectionPool (open=True at module level) + init_db()
+├── etl/
+│   ├── metadata_pipeline.py     # Fetches all 3072 WHO indicators into indicators_metadata
+│   └── cache_pipeline.py        # One-time SQLite → Neon migration (done)
+└── services/
+    ├── metadata_service.py      # search_indicators(), resolve_indicator()
+    ├── cache_service.py         # get_or_fetch(), is_cached(), get_coverage(), _store_coverage()
+    ├── health_service.py        # Pure computation: percentiles, distribution stats, trend classification
+    └── llm_service.py           # infer_and_store_direction() — LLM call to determine higher_is_better
+
+frontend-app/
+├── src/
+│   ├── App.jsx                  # Main component, SSE streaming, evidence table rendering
+│   └── App.css                  # Styling, Inter font
+├── index.html                   # Google Fonts import
+├── .env.local                   # VITE_API_URL=http://localhost:8000 (gitignored)
+└── vercel.json                  # Build config (inside frontend-app/ since that's Vercel root)
+
+Copy
+Key Concepts & Design Decisions
+1. Cache-Aside Pattern
+WHO API is slow and rate-limited. Every indicator is fetched once and stored in indicator_cache. On subsequent queries, data comes from Neon (fast). On a cache miss, get_or_fetch() fetches from WHO, stores, then returns.
+
+query("obesity", "USA", 2019)
+  → resolve_indicator("obesity") → NCD_BMI_30C
+  → is_cached("NCD_BMI_30C")? → yes
+  → query indicator_cache WHERE code=NCD_BMI_30C AND country=USA AND year=2019
+  → return value
+
+Copy
+2. Composite MCP Tools
+V1 tools required the LLM to pass WHO codes. LLMs are bad at remembering opaque identifiers across tool calls. V2 tools accept plain English — resolution happens internally.
+
+compare_countries("USA", "JPN", 2019, ["obesity", "life expectancy"])
+# internally: resolve_indicator("obesity") → NCD_BMI_30C
+#             resolve_indicator("life expectancy") → WHOSIS_000001
+
+Copy
+python
+3. Indicator Resolution — Weighted Ranking
+resolve_indicator(name) does ILIKE '%name%' but orders by multiple signals:
+
+Exact name match
+
+Has cached data (prefers indicators we already have)
+
+higher_is_better IS NOT NULL (prefers indicators with known direction)
+
+Word boundary match (~* regex in PostgreSQL)
+
+Shortest name
+
+Alphabetical
+
+This is described as "information retrieval, not string matching."
+
+4. LLM-Inferred higher_is_better
+When a new indicator is fetched and higher_is_better is NULL in the DB, a lightweight Groq call asks: "Is a higher value better or worse for this indicator?" Answer stored permanently. One-time cost per indicator.
+
+5. Coverage Metadata
+After caching an indicator, we store {min_year, max_year, country_count, countries[]} as JSONB in indicators_metadata. Used for:
+
+Nearest-year fallback (±2 years) when exact year missing
+
+Distinguishing no_data_for_country vs no_data_for_year vs no_data_for_indicator
+
+Avoiding re-fetches for indicators with no WHO data
+
+6. MCP Protocol
+MCP (Model Context Protocol) is Anthropic's open standard for connecting LLMs to external tools. In this project:
+
+server.py runs as a subprocess via stdio transport
+
+api.py spawns it using StdioServerParameters and manages a ClientSession
+
+Tools are registered with @mcp.tool() decorator
+
+api.py converts MCP tool schemas to Groq function-calling format
+
+7. SSE Streaming
+api.py uses Server-Sent Events to stream 3 event types to the frontend:
+
+tool_call — which tool was called and with what args
+
+tool_result — the structured JSON result
+
+answer_token — LLM narrative word by word
+
+8. psycopg v3 Gotchas
+conn.executemany() doesn't exist — must use with conn.cursor() as cur: cur.executemany()
+
+pool.connection() auto-rolls back unless you call conn.commit() explicitly
+
+ConnectionPool must be initialized with open=True at module level — not inside a function
+
+9. Windows UTF-8 Issue
+server.py runs as a subprocess on Windows where stdout defaults to cp1252. WHO indicator names contain unicode (≥, →). Fix: sys.stdout.reconfigure(encoding="utf-8") at the top of server.py.
+
+10. Groq Tool Schema Patching
+FastMCP generates tool schemas where list[str] parameters have type: array but no items field. Groq's model fails to generate valid JSON for these. Fix: patch_schema() in api.py deep-copies each tool's schema and injects "items": {"type": "string"} for any array property missing it.
+
+Data Flow (Full Request Lifecycle)
+User types: "Compare obesity in USA vs Japan 2019"
+         ↓
+Frontend POST /query
+         ↓
+api.py run_agent_stream()
+         ↓
+Groq LLM → decides to call compare_countries()
+         ↓
+SSE: tool_call event → frontend shows "compare_countries() running"
+         ↓
+api.py calls MCP session → server.py compare_countries()
+         ↓
+resolve_indicator("obesity") → NCD_BMI_30C (from indicators_metadata)
+         ↓
+get_or_fetch("NCD_BMI_30C") → already cached → skip WHO fetch
+         ↓
+query_cache(NCD_BMI_30C, USA, 2019) → 40.42
+query_cache(NCD_BMI_30C, JPN, 2019) → 4.48
+         ↓
+get_global_distribution() → all country values for 2019
+health_percentile() → USA: 8.1 (bad), JPN: 91.9 (good)
+         ↓
+returns JSON comparison result
+         ↓
+SSE: tool_result event → frontend renders evidence table
+         ↓
+Groq LLM → writes 2-3 sentence narrative with actual numbers
+         ↓
+SSE: answer_token events → frontend streams narrative word by word
+         ↓
+SSE: done event
+
+
+Copy
+PRELOAD_INDICATORS (26 indicators currently cached)
+Code	Indicator	higher_is_better
+WHOSIS_000001	Life expectancy at birth	True
+WHOSIS_000002	Healthy life expectancy (HALE)	True
+WHS4_100	Hospital bed density	True
+HRH_26	Physician density	True
+GHED_CHE_pc_US_SHA2011	Health expenditure per capita	True
+WSH_SANITATION_BASIC	Basic sanitation access	True
+NCD_BMI_30C	Obesity prevalence	False
+NCD_BMI_PLUS2C	Childhood obesity	False
+NCD_DIABETES_PREVALENCE_CRUDE	Diabetes prevalence	False
+NCD_HYP_PREVALENCE_C	Hypertension prevalence	False
+NCDMORT3070	NCD mortality (30-70)	False
+WHS2_131	Age-standardized NCD mortality	False
+MDG_0000000001	Infant mortality rate	False
+MDG_0000000026	Maternal mortality ratio	False
+SDGSUICIDE	Suicide rate	False
+RS_198	Road traffic death rate	False
+HIV_0000000026	New HIV infections	False
+TB_c_newinc	Tuberculosis new cases	False
+MALARIA_PRES_CASES	Malaria cases	False
+GDO_q35	Depression prevalence	False
+SDGPM25	Air pollution PM2.5	False
+NCD_CHOL_MEANTOTALCHOL_C	Mean total cholesterol	False
+NUTRITION_ANAEMIA_CHILDREN_PREV	Anaemia in children	False
+stunt5	Stunting under 5	False
+wast5	Wasting under 5	False
+WHS6_102	Hospital beds per 10,000	True
+What's Left (V2 Remaining)
+Phase 4 — Smoke Testing (in progress)
+6 natural language queries to verify end-to-end correctness across all 4 tools.
+
+Phase 5 — Frontend Improvements
+From v2.md:
+
+Fix Strongest/Weakest indicator display (currently shows raw WHO codes like NCD_BMI_30C instead of human-readable names)
+
+Better evidence table rendering for missing data (show reason, show fallback year note)
+
+Trend visualization (chart for get_health_trend results)
+
+General UI polish
+
+Future / V3 Ideas
+Semantic search with embeddings for indicator resolution (currently ILIKE + ranking signals)
+
+confidence score returned alongside resolved indicator
+
+Vaccination coverage indicators
+
+Clean water access
+
+Tobacco/alcohol use prevalence
+
+Scheduled cache refresh for stale indicators
+
+Coverage metadata used to show users "data available from X to Y" in the UI
+
+Good Interview Discussion Topics
+Why MCP over direct function calling? Separation of concerns — tools are independently runnable, testable, and reusable across different LLM clients
+
+Why cache-aside over direct WHO API calls? Latency, rate limits, reliability — WHO API is slow and occasionally flaky
+
+Why PostgreSQL over SQLite? Concurrent access, JSONB for coverage metadata, ILIKE + regex for indicator search, serverless scaling with Neon
+
+Why store higher_is_better in DB vs config? Config doesn't scale to 3072 indicators. DB + LLM inference means any new indicator gets correct direction automatically
+
+Why composite tools? LLMs fail when they must remember opaque identifiers (WHO codes) across tool calls. Composite tools that resolve internally are more reliable
+
+What is the coverage metadata solving? Three distinct failure modes that all looked the same before: no data for this indicator ever, no data for this country, no data for this specific year
