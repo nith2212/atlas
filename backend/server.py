@@ -1,110 +1,101 @@
 """
-MCP tools server — exposes 4 analytical tools over stdio.
-Each tool performs real computation (percentiles, distribution stats, trend
-classification) so the LLM receives findings, not raw rows.
+MCP tools server — 4 composite analytical tools + 1 search tool.
+Tools accept natural language indicator names — WHO code resolution happens
+internally so the LLM never has to remember opaque identifiers.
 """
 
+import sys
 import json
-import sqlite3
-import statistics
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
 from mcp.server.fastmcp import FastMCP
-from config import DB_PATH, INDICATORS
+from database.postgres import pool, init_db
+from services.metadata_service import (
+    search_indicators as _search_indicators,
+    resolve_indicator,
+    list_categories,
+)
+from services.cache_service import get_indicator_value as _get_indicator_value, get_or_fetch, get_coverage
+from services.health_service import (
+    get_global_distribution,
+    health_percentile,
+    distribution_stats,
+    classify_trend,
+)
 
-mcp = FastMCP("etl-mcp-health")
+mcp = FastMCP("atlas")
 
 
 # ---------------------------------------------------------------------------
-# DB helper
+# Internal helpers
 # ---------------------------------------------------------------------------
 
-def query_db(sql: str, params: tuple = ()):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute(sql, params)
-        return [dict(row) for row in cursor.fetchall()]
-
-
-# ---------------------------------------------------------------------------
-# Analytical helpers
-# ---------------------------------------------------------------------------
-
-def get_global_distribution(indicator_name: str, year: int) -> list[float]:
-    """Returns all country values for an indicator/year — used for percentile and stats."""
-    rows = query_db(
-        "SELECT numeric_value FROM disease_indicators WHERE indicator_name = ? AND year = ?",
-        (indicator_name.upper(), year),
-    )
-    return [r["numeric_value"] for r in rows]
-
-
-def compute_percentile(value: float, distribution: list[float]) -> float:
-    """Raw percentile: % of countries with a value <= this one."""
-    if not distribution:
-        return 0.0
-    return round(sum(1 for v in distribution if v <= value) / len(distribution) * 100, 1)
-
-
-def health_percentile(value: float, distribution: list[float], higher_is_better: bool) -> float:
+def query_cache(indicator_code: str, filters: dict = {}) -> tuple[list[dict], str | None]:
     """
-    Health-adjusted percentile: always higher = healthier.
-    For lower_is_better indicators (PM2.5, NCD mortality), raw percentile is inverted
-    so a country with very low PM2.5 gets a high health percentile.
+    Queries indicator_cache with filters.
+    For single-year lookups: falls back to nearest year (±2) if exact year missing.
+    Returns (rows, warning) where warning describes any fallback or missing reason.
     """
-    raw = compute_percentile(value, distribution)
-    return raw if higher_is_better else round(100 - raw, 1)
+    conditions = ["indicator_code = %s", "country_code != '__NOCOVERAGE__'"]
+    params = [indicator_code]
+
+    country = filters.get("country_code")
+    year    = filters.get("year")
+
+    if country:
+        conditions.append("country_code = %s")
+        params.append(country)
+    if "year_between" in filters:
+        conditions.append("year BETWEEN %s AND %s")
+        params.extend(filters["year_between"])
+    if year:
+        conditions.append("year = %s")
+        params.append(year)
+
+    order = filters.get("order", "country_code, year")
+    limit = filters.get("limit")
+    sql   = f"SELECT country_code, year, value FROM indicator_cache WHERE {' AND '.join(conditions)} ORDER BY {order}"
+    if limit:
+        sql += f" LIMIT {limit}"
+
+    with pool.connection() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    result = [{"country_code": r[0], "year": r[1], "value": r[2]} for r in rows]
+
+    # Nearest-year fallback for single country+year lookups
+    if not result and country and year and "year_between" not in filters:
+        coverage = get_coverage(indicator_code)
+        if coverage and coverage["country_count"] == 0:
+            return [], "no_data_for_indicator"
+        if coverage and country not in coverage.get("countries", []):
+            return [], "no_data_for_country"
+
+        # Try ±2 years
+        for delta in [1, -1, 2, -2]:
+            fallback_year = year + delta
+            with pool.connection() as conn:
+                row = conn.execute("""
+                    SELECT country_code, year, value FROM indicator_cache
+                    WHERE indicator_code = %s AND country_code = %s AND year = %s
+                """, (indicator_code, country, fallback_year)).fetchone()
+            if row:
+                return [
+                    {"country_code": row[0], "year": row[1], "value": row[2],
+                     "note": f"{year} not available, showing {row[1]}"}
+                ], f"year_fallback:{row[1]}"
+
+        return [], "no_data_for_year"
+
+    return result, None
 
 
-def distribution_stats(values: list[float]) -> dict:
-    """Mean, median, min, max, stdev computed in Python (SQLite has no STDEV)."""
-    if not values:
-        return {}
-    return {
-        "mean":   round(statistics.mean(values), 2),
-        "median": round(statistics.median(values), 2),
-        "min":    round(min(values), 2),
-        "max":    round(max(values), 2),
-        "stdev":  round(statistics.stdev(values), 2) if len(values) >= 2 else None,
-        "n":      len(values),
-    }
-
-
-def classify_trend(points: list[dict], higher_is_better: bool) -> str:
-    """
-    Classifies a time series as improving / declining / volatile / stable / insufficient_data.
-
-    Rules:
-    - Fewer than 4 data points → insufficient_data (slope is not meaningful)
-    - Tolerance is fixed at 1% of the first value in the range (global anchor, not per-segment)
-      so tiny noise doesn't register as a direction change
-    - If no change exceeds the tolerance band → stable
-    - More than 1 sign flip in significant changes → volatile
-    - Otherwise → improving or declining based on last significant move, adjusted for direction.
-      For lower_is_better indicators (PM2.5, NCD mortality), a rising value is declining health,
-      so the label is inverted: value going up = "declining", value going down = "improving".
-    """
-    if len(points) < 4:
-        return "insufficient_data"
-
-    changes = [points[i + 1]["value"] - points[i]["value"] for i in range(len(points) - 1)]
-    # Fixed tolerance anchored to range start value
-    tolerance = abs(points[0]["value"]) * 0.01
-
-    significant = [c for c in changes if abs(c) > tolerance]
-
-    if not significant:
-        return "stable"
-
-    direction_changes = sum(
-        1 for i in range(len(significant) - 1)
-        if significant[i] * significant[i + 1] < 0
-    )
-
-    if direction_changes > 1:
-        return "volatile"
-
-    value_went_up = significant[-1] > 0
-    return "improving" if (value_went_up == higher_is_better) else "declining"
+async def resolve_and_fetch(indicator_name: str) -> tuple[dict, str] | tuple[None, str]:
+    """Resolve natural language name → meta dict. Fetch into cache if needed. Returns (meta, error)."""
+    meta = resolve_indicator(indicator_name)
+    if not meta:
+        return None, f"No indicator found matching '{indicator_name}'. Try search_indicators to explore."
+    await get_or_fetch(meta["code"])
+    return meta, None
 
 
 # ---------------------------------------------------------------------------
@@ -112,52 +103,93 @@ def classify_trend(points: list[dict], higher_is_better: bool) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def get_country_health_profile(country_code: str, year: int) -> str:
+async def get_country_health_profile(country_code: str, year: int, indicators: list[str]) -> str:
     """
-    Returns a full health profile for a country in a given year.
-    For each indicator: value, unit, and health-adjusted global percentile.
-    Identifies the country's strongest and weakest indicators by percentile.
-    Flags indicators with missing data for that year.
+    Returns a health profile for a country in a given year.
+    'indicators' is a list of plain English names e.g. ["life expectancy", "air pollution"].
+    For each indicator: value, unit, health-adjusted global percentile.
+    Identifies the strongest and weakest indicators by percentile.
     """
     country = country_code.upper()
-    rows = query_db(
-        "SELECT indicator_name, numeric_value FROM disease_indicators WHERE country_code = ? AND year = ?",
-        (country, year),
-    )
-
-    found = {r["indicator_name"]: r["numeric_value"] for r in rows}
     metrics = []
     health_percentiles = {}
+    indicator_names = {}
 
-    for key, meta in INDICATORS.items():
-        value = found.get(key)
-        if value is None:
-            metrics.append({"indicator": key, "label": meta["label"], "missing": True})
+    for ind_name in indicators:
+        meta, err = await resolve_and_fetch(ind_name)
+        if err:
+            metrics.append({"indicator": ind_name, "missing": True, "reason": err})
             continue
 
-        dist = get_global_distribution(key, year)
-        hp = health_percentile(value, dist, meta["higher_is_better"])
-        health_percentiles[key] = hp
+        rows, warning = query_cache(meta["code"], {"country_code": country, "year": year})
+        if not rows:
+            metrics.append({"indicator": meta["name"], "missing": True, "reason": warning or "no_data"})
+            continue
 
-        metrics.append({
-            "indicator": key,
-            "label":     meta["label"],
-            "value":     round(value, 2),
-            "unit":      meta["unit"],
+        value = rows[0]["value"]
+        dist  = get_global_distribution(meta["code"], year)
+        hp    = health_percentile(value, dist, meta["higher_is_better"])
+        health_percentiles[meta["code"]] = hp
+        indicator_names[meta["code"]] = meta["name"]
+
+        entry = {
+            "indicator":         meta["code"],
+            "label":             meta["name"],
+            "value":             round(value, 2),
+            "unit":              meta["unit"],
             "health_percentile": hp,
-            "missing":   False,
-        })
+            "missing":           False,
+        }
+        if rows[0].get("note"):
+            entry["note"] = rows[0]["note"]
+        metrics.append(entry)
 
     best  = max(health_percentiles, key=health_percentiles.get) if health_percentiles else None
     worst = min(health_percentiles, key=health_percentiles.get) if health_percentiles else None
 
     return json.dumps({
-        "type":     "profile",
-        "country":  country,
-        "year":     year,
-        "metrics":  metrics,
-        "strongest_indicator": best,
-        "weakest_indicator":   worst,
+        "type":                "profile",
+        "country":             country,
+        "year":                year,
+        "metrics":             metrics,
+        "strongest_indicator": indicator_names.get(best),
+        "weakest_indicator":   indicator_names.get(worst),
+    })
+
+
+# ---------------------------------------------------------------------------
+# Tool 2: get_indicator_value
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def get_indicator_value(indicator: str, country_code: str, year: int) -> str:
+    """Returns a categorical indicator value for one country and year.
+    Use this for yes/no or status indicators such as program implementation.
+    Numeric indicators should use the profile, comparison, ranking, or trend tools.
+    """
+    meta, err = await resolve_and_fetch(indicator)
+    if err:
+        return json.dumps({"type": "error", "message": err})
+
+    row = _get_indicator_value(meta["code"], country_code, year)
+    if not row:
+        return json.dumps({
+            "type": "error",
+            "message": f"No data for {meta['name']} in {country_code.upper()} ({year}).",
+        })
+    if row["value_text"] is None:
+        return json.dumps({
+            "type": "error",
+            "message": f"{meta['name']} is numeric; use a numeric data tool instead.",
+        })
+
+    return json.dumps({
+        "type": "categorical_result",
+        "indicator": meta["name"],
+        "indicator_code": meta["code"],
+        "country": row["country_code"],
+        "year": row["year"],
+        "value": row["value_text"],
     })
 
 
@@ -166,75 +198,72 @@ def get_country_health_profile(country_code: str, year: int) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def compare_countries(country_a: str, country_b: str, year: int) -> str:
+async def compare_countries(country_a: str, country_b: str, year: int, indicators: list[str]) -> str:
     """
-    Compares two countries across ALL health indicators for a given year.
-    For each indicator: both values, absolute difference, which country leads,
-    and each country's health-adjusted global percentile.
-    Identifies the indicator with the largest gap between the two countries.
+    Compares two countries across specified indicators for a given year.
+    'indicators' is a list of plain English names e.g. ["obesity", "life expectancy"].
+    Returns values, percentiles, gap, and which country leads for each indicator.
     """
     ca, cb = country_a.upper(), country_b.upper()
-
-    rows = query_db(
-        "SELECT indicator_name, country_code, numeric_value FROM disease_indicators "
-        "WHERE country_code IN (?, ?) AND year = ?",
-        (ca, cb, year),
-    )
-
-    # Pivot into {indicator: {country: value}}
-    data: dict[str, dict] = {}
-    for r in rows:
-        data.setdefault(r["indicator_name"], {})[r["country_code"]] = r["numeric_value"]
-
     comparisons = []
     gaps = {}
+    indicator_names = {}
 
-    for key, meta in INDICATORS.items():
-        val_a = data.get(key, {}).get(ca)
-        val_b = data.get(key, {}).get(cb)
+    for ind_name in indicators:
+        meta, err = await resolve_and_fetch(ind_name)
+        if err:
+            comparisons.append({"indicator": ind_name, "missing": True, "reason": err})
+            continue
+
+        rows_a, warn_a = query_cache(meta["code"], {"country_code": ca, "year": year})
+        rows_b, warn_b = query_cache(meta["code"], {"country_code": cb, "year": year})
+        val_a = rows_a[0]["value"] if rows_a else None
+        val_b = rows_b[0]["value"] if rows_b else None
 
         if val_a is None or val_b is None:
             comparisons.append({
-                "indicator": key,
-                "label":     meta["label"],
-                "missing":   True,
-                country_a:   round(val_a, 2) if val_a is not None else None,
-                country_b:   round(val_b, 2) if val_b is not None else None,
+                "indicator":   meta["name"],
+                "resolved_as": meta["code"],
+                "missing":     True,
+                "reason_a":    warn_a,
+                "reason_b":    warn_b,
+                ca:            round(val_a, 2) if val_a is not None else None,
+                cb:            round(val_b, 2) if val_b is not None else None,
             })
             continue
 
-        dist = get_global_distribution(key, year)
+        note_a = rows_a[0].get("note") if rows_a else None
+        note_b = rows_b[0].get("note") if rows_b else None
+
+        dist   = get_global_distribution(meta["code"], year)
         hp_a = health_percentile(val_a, dist, meta["higher_is_better"])
         hp_b = health_percentile(val_b, dist, meta["higher_is_better"])
-
         diff = round(abs(val_a - val_b), 2)
-        gaps[key] = diff
+        gaps[meta["code"]] = diff
+        indicator_names[meta["code"]] = meta["name"]
+        leader = ca if (val_a > val_b) == meta["higher_is_better"] else cb
 
-        # "leads" means better health outcome on this indicator
-        if meta["higher_is_better"]:
-            leader = ca if val_a > val_b else cb
-        else:
-            leader = ca if val_a < val_b else cb
-
-        comparisons.append({
-            "indicator":  key,
-            "label":      meta["label"],
+        entry = {
+            "indicator":  meta["code"],
+            "label":      meta["name"],
             "unit":       meta["unit"],
             "missing":    False,
-            ca: {"value": round(val_a, 2), "health_percentile": hp_a},
-            cb: {"value": round(val_b, 2), "health_percentile": hp_b},
+            ca:           {"value": round(val_a, 2), "health_percentile": hp_a},
+            cb:           {"value": round(val_b, 2), "health_percentile": hp_b},
             "difference": diff,
             "leader":     leader,
-        })
+        }
+        if note_a: entry[f"note_{ca}"] = note_a
+        if note_b: entry[f"note_{cb}"] = note_b
+        comparisons.append(entry)
 
-    largest_gap = max(gaps, key=gaps.get) if gaps else None
-
+    largest_gap_code = max(gaps, key=gaps.get) if gaps else None
     return json.dumps({
-        "type":        "comparison",
-        "countries":   [ca, cb],
-        "year":        year,
-        "comparisons": comparisons,
-        "largest_gap_indicator": largest_gap,
+        "type":                  "comparison",
+        "countries":             [ca, cb],
+        "year":                  year,
+        "comparisons":           comparisons,
+        "largest_gap_indicator": indicator_names.get(largest_gap_code),
     })
 
 
@@ -243,67 +272,52 @@ def compare_countries(country_a: str, country_b: str, year: int) -> str:
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def get_health_trend(country_code: str, indicator_name: str, start_year: int, end_year: int) -> str:
+async def get_health_trend(country_code: str, indicator: str, start_year: int, end_year: int) -> str:
     """
-    Returns a time-series trend for a country/indicator over a year range.
-    Computes: overall % change, year-over-year changes, best/worst year,
-    and classifies the trend as improving / declining / volatile / stable / insufficient_data.
-    Trend classification requires at least 4 data points to be meaningful.
+    Returns a time-series trend for a country and indicator over a year range.
+    'indicator' is a plain English name e.g. "life expectancy".
+    Computes overall % change, year-over-year changes, best/worst outcome year,
+    and classifies the trend as improving/declining/volatile/stable/insufficient_data.
     """
-    key = indicator_name.upper()
     country = country_code.upper()
+    meta, err = await resolve_and_fetch(indicator)
+    if err:
+        return json.dumps({"type": "error", "message": err})
 
-    rows = query_db(
-        "SELECT year, numeric_value FROM disease_indicators "
-        "WHERE country_code = ? AND indicator_name = ? AND year BETWEEN ? AND ? "
-        "ORDER BY year ASC",
-        (country, key, start_year, end_year),
-    )
+    rows, _ = query_cache(meta["code"], {
+        "country_code": country,
+        "year_between": (start_year, end_year),
+        "order": "year ASC",
+    })
 
     if not rows:
-        return json.dumps({
-            "type":    "error",
-            "message": f"No records found for {key} in {country} ({start_year}–{end_year}).",
-        })
+        return json.dumps({"type": "error", "message": f"No data for {meta['name']} in {country} ({start_year}–{end_year})."})
 
-    meta   = INDICATORS.get(key, {})
-    points = [{"year": r["year"], "value": r["numeric_value"]} for r in rows]
-
-    start_val = points[0]["value"]
-    end_val   = points[-1]["value"]
+    points = [{"year": r["year"], "value": r["value"]} for r in rows]
+    start_val, end_val = points[0]["value"], points[-1]["value"]
     pct_change = round(((end_val - start_val) / start_val) * 100, 2) if start_val else 0
 
-    yoy = []
-    for i in range(1, len(points)):
-        prev, curr = points[i - 1]["value"], points[i]["value"]
-        yoy.append({
-            "from_year": points[i - 1]["year"],
-            "to_year":   points[i]["year"],
-            "change":    round(curr - prev, 2),
-            "pct":       round(((curr - prev) / prev) * 100, 2) if prev else 0,
-        })
+    yoy = [{
+        "from_year": points[i - 1]["year"],
+        "to_year":   points[i]["year"],
+        "change":    round(points[i]["value"] - points[i - 1]["value"], 2),
+        "pct":       round(((points[i]["value"] - points[i - 1]["value"]) / points[i - 1]["value"]) * 100, 2) if points[i - 1]["value"] else 0,
+    } for i in range(1, len(points))]
 
-    higher_is_better = meta.get("higher_is_better", True)
-
-    # best_outcome_year = year with highest value for higher_is_better indicators,
-    # year with lowest value for lower_is_better indicators (e.g. least pollution = best year)
-    if higher_is_better:
-        best_outcome_year  = max(points, key=lambda p: p["value"])["year"]
-        worst_outcome_year = min(points, key=lambda p: p["value"])["year"]
-    else:
-        best_outcome_year  = min(points, key=lambda p: p["value"])["year"]
-        worst_outcome_year = max(points, key=lambda p: p["value"])["year"]
+    hib = meta["higher_is_better"]
+    best_outcome_year  = (max if hib else min)(points, key=lambda p: p["value"])["year"]
+    worst_outcome_year = (min if hib else max)(points, key=lambda p: p["value"])["year"]
 
     return json.dumps({
         "type":               "trend",
         "country":            country,
-        "indicator":          meta.get("label", key),
-        "unit":               meta.get("unit", ""),
-        "higher_is_better":   higher_is_better,
+        "indicator":          meta["name"],
+        "unit":               meta["unit"],
+        "higher_is_better":   hib,
         "start_year":         start_year,
         "end_year":           end_year,
         "pct_change":         pct_change,
-        "trend":              classify_trend(points, higher_is_better),
+        "trend":              classify_trend(points, hib),
         "best_outcome_year":  best_outcome_year,
         "worst_outcome_year": worst_outcome_year,
         "points":             points,
@@ -316,54 +330,70 @@ def get_health_trend(country_code: str, indicator_name: str, start_year: int, en
 # ---------------------------------------------------------------------------
 
 @mcp.tool()
-def rank_countries_by_indicator(indicator_name: str, year: int, limit: int = 10) -> str:
+async def rank_countries_by_indicator(indicator: str, year: int, limit: int = 10) -> str:
     """
     Ranks the top N countries by best health outcome for a given indicator and year.
-    Sort direction is determined by higher_is_better: DESC for positive indicators
-    (life expectancy, hospital beds), ASC for negative ones (PM2.5, NCD mortality).
-    Includes each country's health-adjusted percentile and global distribution stats
-    (mean, median, min, max, stdev) so rankings have distributional context.
+    'indicator' is a plain English name e.g. "hospital bed density".
     """
-    key  = indicator_name.upper()
-    meta = INDICATORS.get(key)
+    meta, err = await resolve_and_fetch(indicator)
+    if err:
+        return json.dumps({"type": "error", "message": err})
 
-    if not meta:
-        return json.dumps({"type": "error", "message": f"Unknown indicator: {key}"})
+    dist = get_global_distribution(meta["code"], year)
+    if not dist:
+        return json.dumps({"type": "error", "message": f"No data for {meta['name']} in {year}."})
 
-    order = "DESC" if meta["higher_is_better"] else "ASC"
-    rows  = query_db(
-        f"SELECT country_code, numeric_value FROM disease_indicators "
-        f"WHERE indicator_name = ? AND year = ? ORDER BY numeric_value {order} LIMIT ?",
-        (key, year, limit),
-    )
+    rows, _ = query_cache(meta["code"], {
+        "year":  year,
+        "order": f"value {'DESC' if meta['higher_is_better'] else 'ASC'}",
+        "limit": limit,
+    })
 
-    if not rows:
-        return json.dumps({"type": "error", "message": f"No data for {key} in {year}."})
-
-    dist  = get_global_distribution(key, year)
-    stats = distribution_stats(dist)
-
-    ranks = [
-        {
-            "rank":              i + 1,
-            "country":           r["country_code"],
-            "value":             round(r["numeric_value"], 2),
-            "unit":              meta["unit"],
-            "health_percentile": health_percentile(r["numeric_value"], dist, meta["higher_is_better"]),
-        }
-        for i, r in enumerate(rows)
-    ]
+    ranks = [{
+        "rank":              i + 1,
+        "country":           r["country_code"],
+        "value":             round(r["value"], 2),
+        "unit":              meta["unit"],
+        "health_percentile": health_percentile(r["value"], dist, meta["higher_is_better"]),
+    } for i, r in enumerate(rows)]
 
     return json.dumps({
-        "type":               "ranking",
-        "indicator":          meta["label"],
-        "unit":               meta["unit"],
-        "year":               year,
-        "higher_is_better":   meta["higher_is_better"],
-        "ranks":              ranks,
-        "global_stats":       stats,
+        "type":             "ranking",
+        "indicator":        meta["name"],
+        "unit":             meta["unit"],
+        "year":             year,
+        "higher_is_better": meta["higher_is_better"],
+        "ranks":            ranks,
+        "global_stats":     distribution_stats(dist),
     })
 
 
+# ---------------------------------------------------------------------------
+# Tool 5: search_indicators
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def search_indicators(query: str, category: str | None = None) -> str:
+    """
+    Searches the WHO indicator catalog by name.
+    Optional category scope narrows to a metadata bucket like 'Health status' or 'Risk factors'.
+    Use this only when the user wants to explore what indicators are available.
+    """
+    results = _search_indicators(query, category=category)
+    if not results:
+        return json.dumps({"type": "error", "message": f"No indicators found matching '{query}'"})
+    return json.dumps({"type": "indicator_search", "query": query, "category": category, "results": results})
+
+
+@mcp.tool()
+def browse_categories() -> str:
+    """Lists the category buckets in the WHO catalog and how many indicators sit in each."""
+    categories = list_categories()
+    if not categories:
+        return json.dumps({"type": "error", "message": "No indicator categories are available yet."})
+    return json.dumps({"type": "category_browser", "categories": categories})
+
+
 if __name__ == "__main__":
+    init_db()
     mcp.run(transport="stdio")

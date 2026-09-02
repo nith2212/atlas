@@ -13,7 +13,7 @@ env/
 .envrc
 
 # Database
-#backend/health_signals.db
+backend/health_signals.db
 
 # Node
 node_modules/
@@ -25,3 +25,6 @@ build/
 *.log
 .ruff_cache/
 tempCodeRunnerFile.py
+
+#md
+v2.md

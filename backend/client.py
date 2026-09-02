@@ -11,11 +11,11 @@ from groq import Groq
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import TextContent
+from config import GROQ_MODEL
 
 load_dotenv()
 
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
-MODEL_NAME = "llama-3.3-70b-versatile"
 
 
 async def run_agent():
@@ -43,7 +43,15 @@ async def run_agent():
             print(f"[AGENT] Loaded {len(mcp_tools.tools)} MCP tools into LLM context window.")
             print("=" * 60)
 
-            system_message = {"role": "system", "content": "You are an expert epidemiological assistant. Use your available tools to fetch exact health indicators before answering. Never guess numbers. The only valid indicator_name values are: NCD_MORTALITY_PROB, AIR_POLLUTION_PM25, HOSPITAL_BED_DENSITY, LIFE_EXPECTANCY. Always use these exact strings when calling tools. Country codes must be ISO 3-letter codes (e.g. FRA for France, MEX for Mexico, IND for India)."}
+            system_message = {
+                "role": "system",
+                "content": (
+                    "You are an expert epidemiological assistant with access to the full WHO Global Health Observatory. "
+                    "All tools accept plain English indicator names like 'obesity', 'life expectancy', 'air pollution' — never look up WHO codes. "
+                    "Country codes must be ISO 3-letter codes (e.g. FRA, MEX, IND, CHN, USA, JPN). "
+                    "Use the available tools to fetch exact data before answering. Never guess numbers."
+                ),
+            }
 
             while True:
                 user_prompt = input("\nEnter your health query (or 'exit' to quit): ").strip()
@@ -59,7 +67,7 @@ async def run_agent():
                 # Agentic loop: keep calling tools until Groq returns a final text response
                 while True:
                     response = client.chat.completions.create(
-                        model=MODEL_NAME,
+                        model=GROQ_MODEL,
                         messages=messages,
                         tools=groq_tools,
                         tool_choice="auto",
