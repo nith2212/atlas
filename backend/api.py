@@ -4,6 +4,7 @@ agent activity and answer tokens to the frontend via POST /query.
 """
 
 import os
+import sys
 import json
 from contextlib import asynccontextmanager
 from dotenv import load_dotenv
@@ -42,7 +43,10 @@ mcp_state = {"session": None, "groq_tools": [], "stdio_cm": None, "session_cm": 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    server_params = StdioServerParameters(command="python", args=["server.py"])
+    backend_dir = os.path.dirname(os.path.abspath(__file__))
+    server_script = os.path.join(backend_dir, "server.py")
+    python_exec = sys.executable
+    server_params = StdioServerParameters(command=python_exec, args=[server_script])
     stdio_cm = stdio_client(server_params)
     read, write = await stdio_cm.__aenter__()
     session_cm = ClientSession(read, write)
