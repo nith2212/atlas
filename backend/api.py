@@ -46,7 +46,11 @@ async def lifespan(app: FastAPI):
     backend_dir = os.path.dirname(os.path.abspath(__file__))
     server_script = os.path.join(backend_dir, "server.py")
     python_exec = sys.executable
-    server_params = StdioServerParameters(command=python_exec, args=[server_script])
+    server_params = StdioServerParameters(
+        command=python_exec,
+        args=[server_script],
+        env={**os.environ},
+    )
     stdio_cm = stdio_client(server_params)
     read, write = await stdio_cm.__aenter__()
     session_cm = ClientSession(read, write)

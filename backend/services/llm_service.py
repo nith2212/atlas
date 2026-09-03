@@ -8,7 +8,13 @@ from groq import Groq
 from database.postgres import pool
 from config import GROQ_MODEL
 
-_client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+_client = None
+
+def _get_client() -> Groq:
+    global _client
+    if _client is None:
+        _client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+    return _client
 
 
 def infer_and_store_direction(indicator_code: str, indicator_name: str) -> bool:
@@ -18,7 +24,7 @@ def infer_and_store_direction(indicator_code: str, indicator_name: str) -> bool:
     Falls back to True on any failure.
     """
     try:
-        resp = _client.chat.completions.create(
+        resp = _get_client().chat.completions.create(
             model=GROQ_MODEL,
             messages=[
                 {
