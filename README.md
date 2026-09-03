@@ -385,3 +385,17 @@ etl-mcp-health/
         ├── App.jsx
         └── App.css
 ```
+
+      ---
+
+      ## Future Improvements
+
+      Atlas is an active work in progress. Planned improvements include:
+
+      - Availability-aware category browsing that hides indicators without usable WHO data
+      - Clear live-fetching progress while new indicator data is loaded from WHO
+      - Cached availability checks with better handling for temporary API failures
+      - Improved WHO metadata, descriptions, and indicator categorization
+      - Trend and ranking charts in the frontend
+      - More robust validation, automated tests, and deployment monitoring
+      - Broader support for additional LLM providers and MCP clients
