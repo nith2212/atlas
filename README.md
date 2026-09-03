@@ -4,7 +4,7 @@ Ask a question in plain English. Atlas autonomously picks the right analytical t
 answer against live WHO data cached in PostgreSQL, and streams back a structured, evidence-backed
 result — no dashboards to configure, no SQL to write.
 
-**Live demo:** [[your-render-or-vercel-url-here](#)](https://atlas-ui-drab.vercel.app/)
+**Live demo:** https://atlas-ui-drab.vercel.app/
 
 ---
 
