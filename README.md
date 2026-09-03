@@ -4,12 +4,7 @@ Ask a question in plain English. Atlas autonomously picks the right analytical t
 answer against live WHO data cached in PostgreSQL, and streams back a structured, evidence-backed
 result — no dashboards to configure, no SQL to write.
 
-**Live demo:** [your-render-or-vercel-url-here](#)
-
-```
-Backend (Render):   https://your-app.onrender.com
-Frontend (Vercel):  https://your-app.vercel.app
-```
+**Live demo:** [[your-render-or-vercel-url-here](#)](https://atlas-ui-drab.vercel.app/)
 
 ---
 
@@ -81,7 +76,7 @@ FastAPI + SSE Gateway (api.py)   ← spawns the MCP server, bridges Groq ⇄ MCP
 React Frontend (Vite)           ← category browser, query bar, typed evidence renderer
 ```
 
-**The LLM writes prose. The tools compute findings. React renders typed evidence. Nobody swaps
+**The LLM gets the natural language, understand what indicator is needed and then chooses which tools to use. The tools compute findings. React renders typed evidence. Nobody swaps
 jobs.** This separation is what keeps the answers factually grounded — the model can't
 hallucinate a percentile because it never computes one; it only reads back what the tool returned.
 
@@ -390,15 +385,3 @@ etl-mcp-health/
         ├── App.jsx
         └── App.css
 ```
-
----
-
-## Roadmap
-
-- [x] Neon PostgreSQL metadata + cache schema
-- [x] Lazy cache-aside fetching with historical fallback
-- [x] Category browser + indicator detail modal
-- [x] Categorical (non-numeric) indicator support
-- [x] PDF / plain-text export
-- [ ] Charts for trend and ranking evidence
-- [ ] Richer dashboard view beyond the query bar
