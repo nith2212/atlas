@@ -360,8 +360,6 @@ Swap Groq for OpenAI/Anthropic/a local model by only touching `api.py`:
 - `How has life expectancy changed in Nigeria between 2015 and 2020?`
 - `Rank the top 10 countries by hospital bed density in 2018`
 - `Compare air pollution between China and India in 2020`
-- `Does Benin have a national nutrition awareness program?`
-
 ---
 
 ## Project Structure
